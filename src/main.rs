@@ -21,8 +21,8 @@ struct Args {
     /// Redundant connections per shard; each carries the same symbols.
     #[arg(long, default_value_t = 2, value_parser = clap::value_parser!(u16).range(1..))]
     legs: u16,
-    /// Seconds between full discovery passes (a pass itself takes a while:
-    /// Polymarket lists ~280k markets through one sequential cursor).
+    /// Seconds between full discovery passes (a pass itself takes minutes:
+    /// Polymarket pages ~280k markets through sequential cursors).
     #[arg(long, default_value_t = 300)]
     full_discovery_secs: u64,
     /// Seconds between polls for newly listed markets.
