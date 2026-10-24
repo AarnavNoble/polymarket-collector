@@ -1,25 +1,10 @@
-//! The engine owns every order book.
+//! The engine owns every order book. Each leg keeps its own copy; the
+//! *output* book, which is what gets written, applies every update once, from
+//! whichever leg delivered it first. It is dropped only when no synced leg
+//! remains, so an update is never written without the book it applies to.
 //!
-//! Each symbol is subscribed on several redundant legs. Every leg keeps its own
-//! copy of the book, and the engine keeps one more, the *output* book, which
-//! is what gets written: the merge of all legs' updates, each applied once,
-//! from whichever leg delivered it first. Racing the legs this way takes the
-//! minimum latency over connections for every update (connections differ by
-//! several ms; see LATENCY.md), and losing a leg costs nothing while another
-//! is synced, because the survivor keeps feeding the same output book. Only
-//! when no synced leg remains is the output dropped, to restart from the next
-//! snapshot, so an update is never written without the book it applies to.
-//!
-//! The engine also polices completeness:
-//! - every subscribed symbol must receive a book on every leg within
-//!   [`BOOK_TIMEOUT`], else it is resynced, and a leg that keeps failing to
-//!   deliver books the exchange demonstrably serves is reconnected;
-//! - a leg that goes silent while its siblings receive data is frozen (the
-//!   exchange keeps answering pings on such sockets) and is reconnected;
-//! - optionally, output books are spot-checked against the exchange's REST
-//!   snapshots, stalest first. Quiet symbols are exactly where a silently
-//!   dropped update would go unnoticed longest, so this doubles as the
-//!   low-activity monitor.
+//! It also polices completeness: overdue books are resynced, frozen legs
+//! reconnected, and output books spot-checked against REST (see README).
 
 use std::hash::{Hash, Hasher};
 use std::time::Duration;
@@ -79,10 +64,8 @@ pub const FREEZE_TIMEOUT: Duration = Duration::from_secs(60);
 
 const HEALTH_INTERVAL: Duration = Duration::from_secs(5);
 
-/// Book timestamps are the time of the book's last change, on the websocket
-/// and in REST alike. A reference whose last change is newer than ours only
-/// proves a gap once that change is old enough that it can no longer be in
-/// flight to us.
+/// A reference whose last change is newer than ours proves a gap only once
+/// that change can no longer be in flight to us.
 const VERIFY_IN_FLIGHT: TimeDelta = TimeDelta::seconds(2);
 
 struct LegBook {
@@ -104,13 +87,9 @@ impl LegBook {
     }
 }
 
-/// The book as written: every leg's updates merged, each applied once.
-///
-/// Updates set a level's absolute quantity, so updates to different levels
-/// commute and merge order only matters within a level. A copy of an update
-/// is therefore stale exactly when the output already applied something newer
-/// at that level (or a newer book). Copies from the same millisecond are
-/// recognised by their identity.
+/// The book as written. Updates set absolute quantities, so order matters only
+/// within a level: a copy is stale if its level already applied something
+/// newer, or the same update in the same millisecond.
 struct Output {
     book: OrderBook,
     /// Newest exchange timestamp applied.
@@ -166,11 +145,9 @@ struct Market {
     /// remains.
     output: Option<Output>,
     verified_at: Option<Instant>,
-    /// The output's timestamp when it last disagreed with a reference.
-    /// Several changes can share one exchange millisecond and the REST cache
-    /// may capture the middle of such a burst, so one mismatch is only a
-    /// suspicion; it is confirmed if the next check still disagrees and the
-    /// output has not changed since.
+    /// The output's timestamp when it last disagreed with a reference. REST
+    /// can capture the middle of a same-millisecond burst, so a mismatch is
+    /// confirmed only if the next check disagrees at the same timestamp.
     suspect: Option<DateTime<Utc>>,
 }
 
@@ -351,12 +328,9 @@ impl Engine {
                 lb.book = OrderBook::from_levels(&bids, &asks);
                 lb.synced = true;
                 lb.attempts = 0;
-                // Exchanges also push books mid-stream (Polymarket does after
-                // trades). One strictly newer than everything the output has
-                // applied that disagrees with it carries information the
-                // updates did not, so the output is rebased on it. Books at
-                // or before the output's time may be mid-burst or a lagging
-                // leg's, and are ignored.
+                // A mid-stream book rebases the output only if strictly newer
+                // and different; older or same-instant ones may be a lagging
+                // leg's or mid-burst.
                 let rebase = m
                     .output
                     .as_ref()
@@ -591,10 +565,8 @@ impl Engine {
         }
         self.stats.mismatches += 1;
         m.suspect = None;
-        // Live runs show the exchange's incremental feed can omit a change
-        // that its snapshots include, identically on every connection, so the
-        // legs are usually wrong in the same way: resync every leg and write
-        // nothing until a fresh snapshot arrives.
+        // The exchange's feed can omit a change identically on every
+        // connection, so every leg is resynced.
         let legs_agree = m.legs.iter().any(|l| l.synced && l.book == out.book);
         self.stats.legs_agreed += u64::from(legs_agree);
         tracing::warn!(%symbol, legs_agree, "book differs from exchange reference; resyncing all legs");

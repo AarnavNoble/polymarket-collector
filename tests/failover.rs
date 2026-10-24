@@ -2,7 +2,7 @@
 //! that kills one leg mid-stream, and checks the output stays consistent.
 
 use std::sync::Arc;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicI64, AtomicUsize, Ordering};
 use std::time::Duration;
 
 use chrono::Utc;
@@ -88,18 +88,25 @@ impl Exchange for Mock {
 }
 
 /// Connection 0 dies shortly after its snapshot; connection 1 survives and
-/// later publishes an update; reconnections just hold the book.
+/// later publishes an update. Reconnections get the current book, well after
+/// that update, as a real exchange would serve it.
 async fn serve(listener: TcpListener) {
     let accepted = Arc::new(AtomicUsize::new(0));
+    let qty = Arc::new(AtomicI64::new(5));
     loop {
         let (tcp, _) = listener.accept().await.unwrap();
         let n = accepted.fetch_add(1, Ordering::SeqCst);
+        let qty = qty.clone();
         tokio::spawn(async move {
             let mut ws = tokio_tungstenite::accept_async(tcp).await.unwrap();
             let Some(Ok(_subscribe)) = ws.next().await else {
                 return;
             };
-            ws.send(Message::text("S X 5")).await.unwrap();
+            if n >= 2 {
+                tokio::time::sleep(Duration::from_millis(900)).await;
+            }
+            let book = format!("S X {}", qty.load(Ordering::SeqCst));
+            ws.send(Message::text(book)).await.unwrap();
             match n {
                 0 => {
                     tokio::time::sleep(Duration::from_millis(150)).await;
@@ -107,6 +114,7 @@ async fn serve(listener: TcpListener) {
                 }
                 1 => {
                     tokio::time::sleep(Duration::from_millis(500)).await;
+                    qty.store(8, Ordering::SeqCst);
                     ws.send(Message::text("L X 8")).await.unwrap();
                 }
                 _ => {}
