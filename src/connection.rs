@@ -7,7 +7,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use chrono::Utc;
-use futures_util::{SinkExt, StreamExt};
+use futures_util::{Sink, SinkExt, StreamExt};
 use rustc_hash::FxHashSet;
 use tokio::sync::mpsc;
 use tokio::time::{Instant, MissedTickBehavior, interval, sleep, timeout};
@@ -19,7 +19,7 @@ use crate::engine::{EngineMsg, LegId};
 use crate::exchange::Exchange;
 
 /// Commands from the subscription manager to a leg.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub enum Command {
     Subscribe(Vec<String>),
     Unsubscribe(Vec<String>),
@@ -68,6 +68,11 @@ impl Pacer {
 /// How long a leg waits for room in the engine's queue before giving up its
 /// connection.
 const ENGINE_GRACE: Duration = Duration::from_millis(500);
+
+/// How long one websocket write may take. A peer that stopped reading fills
+/// the TCP send buffer, and an unbounded write would block stall detection
+/// and shutdown until the OS gave up.
+const WRITE_TIMEOUT: Duration = Duration::from_secs(5);
 
 enum Exit {
     Cancelled,
@@ -143,11 +148,23 @@ pub async fn run<E: Exchange>(
 fn apply(symbols: &mut FxHashSet<String>, cmd: Command) {
     match cmd {
         Command::Subscribe(s) => symbols.extend(s),
-        Command::Unsubscribe(s) => s.iter().for_each(|s| {
-            symbols.remove(s);
-        }),
+        Command::Unsubscribe(s) => {
+            for s in &s {
+                symbols.remove(s);
+            }
+        }
         Command::Reconnect => {}
     }
+}
+
+async fn send<S>(tx: &mut S, text: impl Into<String>) -> anyhow::Result<()>
+where
+    S: Sink<Message, Error = tokio_tungstenite::tungstenite::Error> + Unpin,
+{
+    timeout(WRITE_TIMEOUT, tx.send(Message::text(text.into())))
+        .await
+        .map_err(|_| anyhow::anyhow!("write timed out"))??;
+    Ok(())
 }
 
 async fn session<E: Exchange>(
@@ -174,9 +191,15 @@ async fn session<E: Exchange>(
 
     let _ = engine.send(EngineMsg::Connected(id)).await;
     let initial: Vec<String> = symbols.iter().cloned().collect();
-    for (i, batch) in initial.chunks(exchange.max_batch()).enumerate() {
-        tx.send(Message::text(exchange.subscribe(batch, i == 0)))
-            .await?;
+    let subscribe = async {
+        for (i, batch) in initial.chunks(exchange.max_batch()).enumerate() {
+            send(&mut tx, exchange.subscribe(batch, i == 0)).await?;
+        }
+        anyhow::Ok(())
+    };
+    tokio::select! {
+        _ = cancel.cancelled() => return Ok(Exit::Cancelled),
+        r = subscribe => r?,
     }
     tracing::debug!(?id, n = initial.len(), "subscribed");
 
@@ -232,7 +255,7 @@ async fn session<E: Exchange>(
                 };
                 apply(symbols, cmd);
                 for frame in frames {
-                    tx.send(Message::text(frame)).await?;
+                    send(&mut tx, frame).await?;
                 }
             }
             _ = heartbeat.tick() => {
@@ -240,8 +263,10 @@ async fn session<E: Exchange>(
                     break Exit::Reconnect("stalled");
                 }
                 match exchange.heartbeat() {
-                    Some(text) => tx.send(Message::text(text)).await?,
-                    None => tx.send(Message::Ping(Default::default())).await?,
+                    Some(text) => send(&mut tx, text).await?,
+                    None => timeout(WRITE_TIMEOUT, tx.send(Message::Ping(Default::default())))
+                        .await
+                        .map_err(|_| anyhow::anyhow!("write timed out"))??,
                 }
             }
             _ = &mut recycle_at => break Exit::Reconnect("recycle"),

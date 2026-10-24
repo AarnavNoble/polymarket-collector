@@ -56,17 +56,22 @@ struct WireChange<'a> {
     hash: &'a str,
 }
 
+/// A full book, as pushed on the websocket and returned by REST.
+#[derive(Deserialize)]
+struct WireBook<'a> {
+    asset_id: &'a str,
+    #[serde(borrow)]
+    bids: Vec<WireLevel<'a>>,
+    #[serde(borrow)]
+    asks: Vec<WireLevel<'a>>,
+    timestamp: &'a str,
+}
+
 #[derive(Deserialize)]
 #[serde(tag = "event_type", rename_all = "snake_case")]
 enum Wire<'a> {
-    Book {
-        asset_id: &'a str,
-        #[serde(borrow)]
-        bids: Vec<WireLevel<'a>>,
-        #[serde(borrow)]
-        asks: Vec<WireLevel<'a>>,
-        timestamp: &'a str,
-    },
+    #[serde(borrow)]
+    Book(WireBook<'a>),
     PriceChange {
         #[serde(borrow)]
         price_changes: Vec<WireChange<'a>>,
@@ -91,60 +96,108 @@ fn levels(wire: &[WireLevel]) -> anyhow::Result<Vec<Level>> {
     wire.iter().map(|l| level(l.price, l.size)).collect()
 }
 
+fn book_event(b: WireBook) -> anyhow::Result<Event> {
+    Ok(Event::Snapshot {
+        symbol: b.asset_id.to_owned(),
+        exchange_ts: ts_from_millis(b.timestamp.parse()?)?,
+        bids: levels(&b.bids)?,
+        asks: levels(&b.asks)?,
+    })
+}
+
+fn change_event(c: &WireChange, exchange_ts: DateTime<Utc>) -> anyhow::Result<Event> {
+    let Level { price, qty } = level(c.price, c.size)?;
+    let side = match c.side {
+        "BUY" => Side::Buy,
+        "SELL" => Side::Sell,
+        other => anyhow::bail!("bad side {other:?}"),
+    };
+    Ok(Event::Level {
+        symbol: c.asset_id.to_owned(),
+        exchange_ts,
+        side,
+        price,
+        qty,
+        id: update_id(c.hash),
+    })
+}
+
+fn gap(symbols: impl IntoIterator<Item = impl Into<String>>) -> Event {
+    Event::Gap {
+        symbols: symbols.into_iter().map(Into::into).collect(),
+    }
+}
+
+/// Decodes one message. Book data that fails to decode is never skipped
+/// silently: its symbols get an [`Event::Gap`], and the first error is
+/// returned once the rest of the message is decoded.
 fn decode_one(msg: Wire, out: &mut Vec<Event>) -> anyhow::Result<()> {
     match msg {
-        Wire::Book {
-            asset_id,
-            bids,
-            asks,
-            timestamp,
-        } => out.push(Event::Snapshot {
-            symbol: asset_id.to_owned(),
-            exchange_ts: ts_from_millis(timestamp.parse()?)?,
-            bids: levels(&bids)?,
-            asks: levels(&asks)?,
-        }),
+        Wire::Book(b) => {
+            let symbol = b.asset_id;
+            book_event(b)
+                .map(|e| out.push(e))
+                .inspect_err(|_| out.push(gap([symbol])))
+        }
         Wire::PriceChange {
             price_changes,
             timestamp,
         } => {
-            let exchange_ts = ts_from_millis(timestamp.parse()?)?;
-            for c in price_changes {
-                let Level { price, qty } = level(c.price, c.size)?;
-                let side = match c.side {
-                    "BUY" => Side::Buy,
-                    "SELL" => Side::Sell,
-                    other => anyhow::bail!("bad side {other:?}"),
-                };
-                out.push(Event::Level {
-                    symbol: c.asset_id.to_owned(),
-                    exchange_ts,
-                    side,
-                    price,
-                    qty,
-                    id: update_id(c.hash),
-                });
+            let exchange_ts = match timestamp
+                .parse()
+                .map_err(anyhow::Error::from)
+                .and_then(ts_from_millis)
+            {
+                Ok(ts) => ts,
+                Err(e) => {
+                    out.push(gap(price_changes.iter().map(|c| c.asset_id)));
+                    return Err(e);
+                }
+            };
+            let mut result = Ok(());
+            for c in &price_changes {
+                match change_event(c, exchange_ts) {
+                    Ok(e) => out.push(e),
+                    Err(e) => {
+                        out.push(gap([c.asset_id]));
+                        result = result.and(Err(e));
+                    }
+                }
             }
+            result
         }
         Wire::MarketResolved { assets_ids } => {
             out.extend(assets_ids.into_iter().map(|s| Event::Closed {
                 symbol: s.to_owned(),
             }));
+            Ok(())
         }
-        Wire::Other => {}
+        Wire::Other => Ok(()),
     }
-    Ok(())
 }
 
-/// A book from the REST API: the websocket `book` message minus its tag.
-#[derive(Deserialize)]
-struct RestBook<'a> {
-    asset_id: &'a str,
-    #[serde(borrow)]
-    bids: Vec<WireLevel<'a>>,
-    #[serde(borrow)]
-    asks: Vec<WireLevel<'a>>,
-    timestamp: &'a str,
+/// Every `asset_id` in a frame that failed to parse, so its symbols can be
+/// resynced. A frame without any carried no book data.
+fn asset_ids(frame: &str) -> Vec<String> {
+    fn collect(v: &serde_json::Value, out: &mut Vec<String>) {
+        match v {
+            serde_json::Value::Object(m) => {
+                for (k, v) in m {
+                    match v {
+                        serde_json::Value::String(s) if k == "asset_id" => out.push(s.clone()),
+                        _ => collect(v, out),
+                    }
+                }
+            }
+            serde_json::Value::Array(a) => a.iter().for_each(|v| collect(v, out)),
+            _ => {}
+        }
+    }
+    let mut out = Vec::new();
+    if let Ok(v) = serde_json::from_str(frame) {
+        collect(&v, &mut out);
+    }
+    out
 }
 
 /// Gamma sends explicit `null`s, which `#[serde(default)]` alone rejects.
@@ -213,8 +266,6 @@ struct GammaPage {
 }
 
 impl Exchange for Polymarket {
-    const NAME: &'static str = "polymarket";
-
     fn ws_url(&self) -> &str {
         &self.ws_url
     }
@@ -258,17 +309,30 @@ impl Exchange for Polymarket {
     }
 
     fn decode(&self, frame: &str, out: &mut Vec<Event>) -> anyhow::Result<()> {
-        match frame.as_bytes().first() {
+        let parsed = match frame.as_bytes().first() {
             // The initial dump after a subscribe arrives as an array of books.
-            Some(b'[') => {
-                for msg in serde_json::from_str::<Vec<Wire>>(frame)? {
-                    decode_one(msg, out)?;
-                }
-                Ok(())
-            }
-            Some(b'{') => decode_one(serde_json::from_str(frame)?, out),
+            Some(b'[') => serde_json::from_str::<Vec<Wire>>(frame),
+            Some(b'{') => serde_json::from_str(frame).map(|msg| vec![msg]),
             // "PONG" and other non-JSON keepalive text.
-            _ => Ok(()),
+            _ => return Ok(()),
+        };
+        match parsed {
+            Ok(msgs) => {
+                // Keep decoding past a bad message: one bad book in a dump
+                // must not cost the books after it.
+                let mut result = Ok(());
+                for msg in msgs {
+                    result = result.and(decode_one(msg, out));
+                }
+                result
+            }
+            Err(e) => {
+                let symbols = asset_ids(frame);
+                if !symbols.is_empty() {
+                    out.push(gap(symbols));
+                }
+                Err(e.into())
+            }
         }
     }
 
@@ -321,16 +385,9 @@ impl Exchange for Polymarket {
                 .error_for_status()?
                 .text()
                 .await?;
-            for b in serde_json::from_str::<Vec<RestBook>>(&text)? {
-                decode_one(
-                    Wire::Book {
-                        asset_id: b.asset_id,
-                        bids: b.bids,
-                        asks: b.asks,
-                        timestamp: b.timestamp,
-                    },
-                    &mut out,
-                )?;
+            for b in serde_json::from_str::<Vec<WireBook>>(&text)? {
+                // A book we cannot decode is simply not checked.
+                out.extend(book_event(b).ok());
             }
         }
         Ok(out)
@@ -448,14 +505,13 @@ async fn paginate(
                 });
             }
         }
-        let take = remaining
+        let left = remaining
             .try_update(Ordering::Relaxed, Ordering::Relaxed, |r| {
                 Some(r - r.min(listings.len()))
             })
-            .unwrap()
-            .min(listings.len());
-        listings.truncate(take);
-        let exhausted = remaining.load(Ordering::Relaxed) == 0;
+            .unwrap();
+        let exhausted = left <= listings.len();
+        listings.truncate(left);
         if !listings.is_empty() {
             out.send(listings)?;
         }
@@ -528,6 +584,28 @@ mod tests {
                 },
             ]
         );
+    }
+
+    #[test]
+    fn undecodable_book_data_resyncs_its_symbols_without_losing_the_rest() {
+        let mut out = Vec::new();
+        let result = Polymarket::default().decode(
+            r#"{"event_type":"price_change","market":"0x1","timestamp":"1700000000456","price_changes":[
+                {"asset_id":"A","price":"0.5","size":"0.1234567","side":"BUY","hash":"x"},
+                {"asset_id":"B","price":"0.5","size":"7","side":"SELL","hash":"y"}]}"#,
+            &mut out,
+        );
+        assert!(result.is_err());
+        assert_eq!(out[0], gap(["A"]));
+        assert!(matches!(&out[1], Event::Level { symbol, .. } if symbol == "B"));
+
+        let mut out = Vec::new();
+        let result = Polymarket::default().decode(
+            r#"[{"event_type":"book","asset_id":"A","timestamp":"1","bids":"oops","asks":[]}]"#,
+            &mut out,
+        );
+        assert!(result.is_err());
+        assert_eq!(out, [gap(["A"])]);
     }
 
     #[test]

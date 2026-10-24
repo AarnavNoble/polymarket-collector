@@ -69,8 +69,6 @@ pub enum Scope {
 }
 
 pub trait Exchange: Send + Sync + 'static {
-    const NAME: &'static str;
-
     fn ws_url(&self) -> &str;
 
     /// How many symbols one connection should carry, given their activity.

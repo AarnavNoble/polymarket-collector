@@ -41,9 +41,9 @@ struct Shard {
 }
 
 impl Shard {
-    fn send(&self, cmd: impl Fn() -> Command) {
+    fn send(&self, cmd: Command) {
         for leg in &self.legs {
-            let _ = leg.send(cmd());
+            let _ = leg.send(cmd.clone());
         }
     }
 }
@@ -207,7 +207,7 @@ impl<E: Exchange> Manager<E> {
                     symbols: symbols.clone(),
                 })
                 .await;
-            self.shards[shard].send(|| Command::Subscribe(symbols.clone()));
+            self.shards[shard].send(Command::Subscribe(symbols));
         }
     }
 
@@ -232,11 +232,7 @@ impl<E: Exchange> Manager<E> {
             .filter(|s| !live.contains(*s))
             .cloned()
             .collect();
-        let gone: Vec<String> = absent
-            .iter()
-            .filter(|s| self.missing.contains(*s))
-            .cloned()
-            .collect();
+        let gone = absent.intersection(&self.missing).cloned().collect();
         self.missing = absent;
         self.remove(gone).await;
         tracing::info!(
@@ -257,7 +253,7 @@ impl<E: Exchange> Manager<E> {
             }
         }
         for (shard, symbols) in removed {
-            self.shards[shard].send(|| Command::Unsubscribe(symbols.clone()));
+            self.shards[shard].send(Command::Unsubscribe(symbols.clone()));
             let _ = self.engine.send(EngineMsg::Removed(symbols)).await;
         }
     }

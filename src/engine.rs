@@ -21,7 +21,6 @@
 //!   dropped update would go unnoticed longest, so this doubles as the
 //!   low-activity monitor.
 
-use std::collections::VecDeque;
 use std::hash::{Hash, Hasher};
 use std::time::Duration;
 
@@ -80,10 +79,6 @@ pub const FREEZE_TIMEOUT: Duration = Duration::from_secs(60);
 
 const HEALTH_INTERVAL: Duration = Duration::from_secs(5);
 
-/// Same-millisecond updates remembered per symbol to recognise a lagging
-/// leg's exact copies (older ones are caught by per-level timestamps).
-const DEDUP_WINDOW: usize = 64;
-
 /// Book timestamps are the time of the book's last change, on the websocket
 /// and in REST alike. A reference whose last change is newer than ours only
 /// proves a gap once that change is old enough that it can no longer be in
@@ -114,7 +109,7 @@ impl LegBook {
 /// Updates set a level's absolute quantity, so updates to different levels
 /// commute and merge order only matters within a level. A copy of an update
 /// is therefore stale exactly when the output already applied something newer
-/// at that level (or a newer book). Exact copies within one millisecond are
+/// at that level (or a newer book). Copies from the same millisecond are
 /// recognised by their identity.
 struct Output {
     book: OrderBook,
@@ -122,10 +117,9 @@ struct Output {
     exchange_ts: DateTime<Utc>,
     /// Timestamp of the book the output was last (re)based on.
     floor: DateTime<Utc>,
-    /// Exchange timestamp of the last update applied at each level.
-    level_ts: FxHashMap<(Side, i64), DateTime<Utc>>,
-    /// Keys of recently applied updates, oldest first.
-    recent: VecDeque<u64>,
+    /// Per level: the exchange timestamp of the last update applied, and the
+    /// keys of every update applied at that timestamp.
+    levels: FxHashMap<(Side, i64), (DateTime<Utc>, Vec<u64>)>,
 }
 
 impl Output {
@@ -134,19 +128,34 @@ impl Output {
             book,
             exchange_ts,
             floor: exchange_ts,
-            level_ts: FxHashMap::default(),
-            recent: VecDeque::new(),
+            levels: FxHashMap::default(),
         }
     }
 
-    /// Whether an update was already applied, or superseded.
-    fn has_seen(&self, exchange_ts: DateTime<Utc>, side: Side, price: i64, key: u64) -> bool {
-        exchange_ts < self.floor
-            || self
-                .level_ts
-                .get(&(side, price))
-                .is_some_and(|&t| exchange_ts < t)
-            || self.recent.contains(&key)
+    /// Records an update unless it was already applied or superseded.
+    fn first_sight(
+        &mut self,
+        exchange_ts: DateTime<Utc>,
+        side: Side,
+        price: i64,
+        key: u64,
+    ) -> bool {
+        if exchange_ts < self.floor {
+            return false;
+        }
+        let (ts, keys) = self
+            .levels
+            .entry((side, price))
+            .or_insert((exchange_ts, Vec::new()));
+        if exchange_ts < *ts || exchange_ts == *ts && keys.contains(&key) {
+            return false;
+        }
+        if exchange_ts > *ts {
+            *ts = exchange_ts;
+            keys.clear();
+        }
+        keys.push(key);
+        true
     }
 }
 
@@ -258,7 +267,9 @@ impl Engine {
                     }
                 }
                 Some(books) = async { verify.as_mut().unwrap().results.recv().await }, if verify.is_some() => {
-                    books.into_iter().for_each(|b| self.verify(b));
+                    for b in books {
+                        self.verify(b);
+                    }
                 }
             }
         }
@@ -397,12 +408,21 @@ impl Engine {
                         .collect()
                 } else {
                     symbols
+                        .into_iter()
+                        .filter(|s| self.markets.get(s).is_some_and(|m| m.shard == leg.shard))
+                        .collect()
                 };
+                if symbols.is_empty() {
+                    return;
+                }
                 let now = Instant::now();
                 for s in &symbols {
-                    if let Some(m) = self.markets.get_mut(s) {
-                        invalidate_leg(m, leg.leg, now, &mut self.stats);
-                    }
+                    invalidate_leg(
+                        self.markets.get_mut(s).unwrap(),
+                        leg.leg,
+                        now,
+                        &mut self.stats,
+                    );
                 }
                 self.stats.resyncs += 1;
                 let _ = self.requests.send(Request::Resync { leg, symbols });
@@ -437,15 +457,10 @@ impl Engine {
         change(&mut lb.book);
 
         let Some(out) = &mut m.output else { return };
-        if out.has_seen(exchange_ts, side, price, key) {
+        if !out.first_sight(exchange_ts, side, price, key) {
             self.stats.duplicates += 1;
             return;
         }
-        if out.recent.len() == DEDUP_WINDOW {
-            out.recent.pop_front();
-        }
-        out.recent.push_back(key);
-        out.level_ts.insert((side, price), exchange_ts);
         out.exchange_ts = out.exchange_ts.max(exchange_ts);
         if let Some(quantity) = change(&mut out.book) {
             self.stats.written += 1;
@@ -781,17 +796,47 @@ mod tests {
     }
 
     #[test]
-    fn replays_older_than_the_dedup_window_are_dropped_by_age() {
+    fn same_millisecond_replays_never_rewind_a_level() {
+        let at = |price, qty| Event::Level {
+            symbol: "X".into(),
+            exchange_ts: ts(20),
+            side: Side::Buy,
+            price,
+            qty,
+            id: qty as u64,
+        };
         let mut h = Harness::new();
         h.send(A, snapshot(5));
         h.send(B, snapshot(5));
-        h.send(A, level(6));
-        for q in 0..DEDUP_WINDOW as i64 {
-            h.send(A, level(10_000 + q)); // pushes level(6) out of the window
+        h.send(A, at(10, 6));
+        h.send(A, at(10, 7));
+        for q in 0..100 {
+            h.send(A, at(11, 1_000 + q)); // a burst elsewhere in the book
         }
         h.drain();
-        h.send(B, level(6)); // 6 ms vs ~10 s: a replay, not news
+        h.send(B, at(10, 6)); // the lagging leg's copies, long after
+        h.send(B, at(10, 7));
         assert_eq!(h.drain(), []);
+        let out = &h.engine.markets["X"].output.as_ref().unwrap().book;
+        assert!(out.bids().any(|l| l.price == 10 && l.qty == 7));
+    }
+
+    #[test]
+    fn gaps_for_unknown_symbols_are_ignored() {
+        let mut h = Harness::new();
+        h.send(
+            A,
+            Event::Gap {
+                symbols: vec!["NO".into()],
+            },
+        );
+        h.send(
+            A,
+            Event::Gap {
+                symbols: vec!["X".into()],
+            },
+        );
+        assert_eq!(h.requests(), ["resync 0 [\"X\"]"]);
     }
 
     #[test]

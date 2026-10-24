@@ -25,7 +25,7 @@ The writer is joined even if a task panicked. A second Ctrl-C forces an exit.
   - Every Polymarket outcome token has its own two-sided book.
   - A binary market's NO book is an exact mirror of its YES book (bid `p` ⇔ ask `1−p`, same size), so collecting both would double the data and add nothing.
   - The YES book is emitted as-is: bids are `Buy` and asks are `Sell`. Sports markets have no "Yes" outcome, so their first outcome is used.
-- **Prices and sizes:** parsed straight from decimal strings into `i64` at 1e6 scale, never through floats (`src/fixed.rs`). A string that cannot be represented exactly is rejected.
+- **Prices and sizes:** parsed straight from decimal strings into `i64` at 1e6 scale, never through floats (`src/fixed.rs`). A string that cannot be represented exactly is rejected, and its symbol is resynced rather than left with a missing update; the rest of the frame is still decoded.
 - **`PriceLevelUpdate`:** carries the absolute quantity at a level (0 removes it). No-op updates are suppressed.
 - **Timestamps:**
   - `backtest_timestamp` / `received_at` is the local wall clock, read as the first statement after the websocket library returns a frame, before our own decoding.
@@ -58,7 +58,7 @@ The writer is joined even if a task panicked. A second Ctrl-C forces an exit.
 | Module | Role |
 |---|---|
 | `exchange/` | The `Exchange` trait (discover, encode commands, decode frames, fetch reference books) and the Polymarket implementation. |
-| `connection.rs` | One websocket leg: paced connect, subscribe in batches, timestamp and decode frames, keepalive, dead-connection detection, jittered exponential backoff, periodic recycling. If the engine's queue stays full for 500 ms, the leg gives up its connection and resyncs rather than dropping frames silently. |
+| `connection.rs` | One websocket leg: paced connect, subscribe in batches, timestamp and decode frames, keepalive, dead-connection detection, 5 s deadline on every write, jittered exponential backoff, periodic recycling. If the engine's queue stays full for 500 ms, the leg gives up its connection and resyncs rather than dropping frames silently. |
 | `manager.rs` | Discovery loops, activity-tiered sharding, and routing of resync and reconnect requests. |
 | `engine.rs` | Owns every book: merges the legs, writes minute snapshots, polices completeness (below). Single task, no locks. |
 | `verify.rs` | Fetches REST reference books for the engine off the hot path. |
@@ -96,7 +96,7 @@ Polymarket has no per-connection subscription cap, but it disconnects sockets wh
 
 **Why the merge is safe.** Polymarket updates set a level's *absolute* quantity, so updates to different levels commute; merge order can only matter within a level. The output records, per level, the exchange time of the last update it applied:
 - A copy older than that, or older than the book the output was last rebased on, is stale and dropped.
-- Exact same-millisecond copies are recognised by identity: timestamp, side, price, size, and Polymarket's per-update book hash.
+- A copy from the same millisecond is recognised by identity (side, price, size, and Polymarket's per-update book hash), checked against every update applied at that level in that millisecond.
 - Books pushed mid-stream rebase the output only if they are strictly newer and differ. Then a lagging leg's copy of the same book, or an older one, can't rewind it.
 
 Measured (busiest 2,000 markets, about 3 min): 562,351 updates written, 553,191 copies from the slower leg discarded. Every confirmed REST mismatch (17 of 17) matched the book one leg had built from its own stream alone, so the merge introduced none of them; see below.
@@ -170,14 +170,14 @@ trait Exchange {
 
 ## Testing
 
-`cargo test` runs 28 unit tests and 1 integration test:
+`cargo test` runs 30 unit tests and 1 integration test:
 - **Fixed-point parsing:** exact cases, rejected inputs, and a property test that round-trips any value.
 - **Books:** a property test against a naive `BTreeMap` model, best-first ordering, and delta clamping.
-- **Polymarket decoding:** book dumps, batched `price_change` entries, keepalive and unknown events, YES-token selection by market version (including Gamma's explicit `null`s, which once stalled a full pass), and end-date window coverage.
+- **Polymarket decoding:** book dumps, batched `price_change` entries, undecodable entries resyncing only their symbol, keepalive and unknown events, YES-token selection by market version (including Gamma's explicit `null`s, which once stalled a full pass), and end-date window coverage.
 - **Writer:** a round trip through the template's reader.
 - **Engine merge:**
   - each update is written once, from whichever leg is first;
-  - a lagging leg never rewinds the output, including replays older than the dedup window;
+  - a lagging leg never rewinds the output, including same-millisecond copies arriving after a long burst;
   - a rebase is never followed by older updates;
   - newer books rebase once, while older or same-instant books don't;
   - losing one leg costs nothing;

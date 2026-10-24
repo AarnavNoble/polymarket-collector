@@ -27,8 +27,6 @@ struct Mock {
 }
 
 impl Exchange for Mock {
-    const NAME: &'static str = "mock";
-
     fn ws_url(&self) -> &str {
         &self.url
     }
