@@ -100,11 +100,11 @@ trait Exchange {
 }
 ```
 
-`Event::Level` covers absolute levels (Polymarket), `Delta` covers signed changes (Kalshi), and `Gap` covers lost data (a Kalshi `seq` break, or a frame that failed to decode). A Kalshi adapter would add RSA-PSS signing of the handshake and fill the update `id` from Kalshi's `clock`. The integration test runs the real manager, legs and engine against a mock exchange with a different wire format.
+An exchange decodes frames into `Event`s: `Snapshot`, `Level` (an absolute quantity), `Closed`, and `Gap` (lost data, such as a sequence break or an undecodable frame). Each `Level` carries an `id` equal on every connection, which the merge uses to recognise copies. A Kalshi adapter would add handshake signing, map `seq` breaks to `Gap`, and add a delta event for Kalshi's signed changes. The integration test runs the real manager, legs and engine against a mock exchange with a different wire format.
 
 ## Testing
 
-`cargo test` runs 30 unit tests and 1 integration test. They cover:
+`cargo test` runs 29 unit tests and 1 integration test. They cover:
 - property tests for decimal parsing and the book;
 - Polymarket decoding, including malformed entries;
 - a writer round trip through the template's reader;

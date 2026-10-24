@@ -287,10 +287,7 @@ impl Engine {
                 // Only book changes prove a leg is live: initial dumps after a
                 // (re)subscribe would otherwise make a quiet shard's legs
                 // take turns looking frozen to each other.
-                if events
-                    .iter()
-                    .any(|e| matches!(e, Event::Level { .. } | Event::Delta { .. }))
-                {
+                if events.iter().any(|e| matches!(e, Event::Level { .. })) {
                     self.last_data.insert(leg, now);
                 }
                 for event in events {
@@ -352,23 +349,35 @@ impl Engine {
                 qty,
                 id,
             } => {
+                // An update for a book this leg holds no snapshot of cannot be
+                // applied correctly; the leg's next snapshot will cover it.
+                let Some(m) = self.markets.get_mut(&symbol) else {
+                    return;
+                };
+                let lb = &mut m.legs[leg.leg];
+                if !lb.synced || m.shard != leg.shard {
+                    return;
+                }
+                lb.book.set(side, price, qty);
+
+                let Some(out) = &mut m.output else { return };
                 let key = update_key(exchange_ts, side, price, qty, id);
-                self.update(leg, recv_ts, symbol, exchange_ts, side, price, key, |b| {
-                    b.set(side, price, qty).then_some(qty.max(0))
-                });
-            }
-            Event::Delta {
-                symbol,
-                exchange_ts,
-                side,
-                price,
-                delta,
-                id,
-            } => {
-                let key = update_key(exchange_ts, side, price, delta, id);
-                self.update(leg, recv_ts, symbol, exchange_ts, side, price, key, |b| {
-                    Some(b.apply_delta(side, price, delta))
-                });
+                if !out.first_sight(exchange_ts, side, price, key) {
+                    self.stats.duplicates += 1;
+                    return;
+                }
+                out.exchange_ts = out.exchange_ts.max(exchange_ts);
+                if out.book.set(side, price, qty) {
+                    self.stats.written += 1;
+                    self.sink.send(Record::Update(PriceLevelUpdateDomain {
+                        backtest_timestamp: recv_ts,
+                        exchange_timestamp: exchange_ts,
+                        price_level: price,
+                        quantity: qty.max(0),
+                        side,
+                        symbol,
+                    }));
+                }
             }
             Event::Closed { symbol } => {
                 let _ = self.requests.send(Request::Closed(vec![symbol]));
@@ -401,51 +410,6 @@ impl Engine {
                 self.stats.resyncs += 1;
                 let _ = self.requests.send(Request::Resync { leg, symbols });
             }
-        }
-    }
-
-    /// Applies one level change to `leg`'s book via `change`, and to the
-    /// output if no leg delivered it before. `change` returns the new absolute
-    /// quantity if the book changed.
-    #[allow(clippy::too_many_arguments)]
-    fn update(
-        &mut self,
-        leg: LegId,
-        recv_ts: DateTime<Utc>,
-        symbol: String,
-        exchange_ts: DateTime<Utc>,
-        side: Side,
-        price: i64,
-        key: u64,
-        change: impl Fn(&mut OrderBook) -> Option<i64>,
-    ) {
-        // An update for a book this leg holds no snapshot of cannot be applied
-        // correctly; the leg's next snapshot will cover it.
-        let Some(m) = self.markets.get_mut(&symbol) else {
-            return;
-        };
-        let lb = &mut m.legs[leg.leg];
-        if !lb.synced || m.shard != leg.shard {
-            return;
-        }
-        change(&mut lb.book);
-
-        let Some(out) = &mut m.output else { return };
-        if !out.first_sight(exchange_ts, side, price, key) {
-            self.stats.duplicates += 1;
-            return;
-        }
-        out.exchange_ts = out.exchange_ts.max(exchange_ts);
-        if let Some(quantity) = change(&mut out.book) {
-            self.stats.written += 1;
-            self.sink.send(Record::Update(PriceLevelUpdateDomain {
-                backtest_timestamp: recv_ts,
-                exchange_timestamp: exchange_ts,
-                price_level: price,
-                quantity,
-                side,
-                symbol,
-            }));
         }
     }
 

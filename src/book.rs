@@ -63,18 +63,6 @@ impl OrderBook {
         }
     }
 
-    /// Applies a signed quantity change (for exchanges that publish deltas)
-    /// and returns the resulting absolute quantity.
-    pub fn apply_delta(&mut self, side: Side, price: i64, delta: i64) -> i64 {
-        let levels = self.side_mut(side);
-        let current = levels
-            .binary_search_by_key(&price, |l| l.price)
-            .map_or(0, |i| levels[i].qty);
-        let qty = (current + delta).max(0);
-        self.set(side, price, qty);
-        qty
-    }
-
     /// Bids best (highest) first.
     pub fn bids(&self) -> impl Iterator<Item = Level> + '_ {
         self.bids.iter().rev().copied()
@@ -154,14 +142,5 @@ mod tests {
             proptest::prop_assert_eq!(book.bids().map(|l| (l.price, l.qty)).collect::<Vec<_>>(), bids);
             proptest::prop_assert_eq!(book.asks().map(|l| (l.price, l.qty)).collect::<Vec<_>>(), asks);
         }
-    }
-
-    #[test]
-    fn deltas_accumulate_and_clamp() {
-        let mut book = OrderBook::default();
-        assert_eq!(book.apply_delta(Side::Sell, 7, 10), 10);
-        assert_eq!(book.apply_delta(Side::Sell, 7, -4), 6);
-        assert_eq!(book.apply_delta(Side::Sell, 7, -6), 0);
-        assert_eq!(book, OrderBook::default());
     }
 }

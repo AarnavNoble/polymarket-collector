@@ -33,20 +33,10 @@ pub enum Event {
         /// recognise the same update arriving on redundant connections.
         id: u64,
     },
-    /// One level changed by `delta` (for exchanges that publish deltas).
-    Delta {
-        symbol: String,
-        exchange_ts: DateTime<Utc>,
-        side: Side,
-        price: i64,
-        delta: i64,
-        /// As for [`Event::Level`].
-        id: u64,
-    },
     /// The exchange reports `symbol` stopped trading.
     Closed { symbol: String },
-    /// The exchange flagged lost data on this connection; resync these symbols
-    /// (all symbols on the connection when empty).
+    /// Data for these symbols was lost on this connection (all of its symbols
+    /// when empty), e.g. a sequence break or an undecodable frame; resync them.
     Gap { symbols: Vec<String> },
 }
 

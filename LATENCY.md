@@ -50,7 +50,7 @@ Findings:
 Consequences for the collector:
 - Reconnect backoff is jittered and grows to 30 s, so a mass disconnect doesn't become a reconnect storm.
 - Recycling happens one leg at a time on about 6 h jittered timers.
-- Every connection attempt goes through one process-wide pacer (`--connects-per-sec`, default 4), so startup and mass reconnects never burst.
+- Every connection attempt goes through one process-wide pacer (4 per second), so startup and mass reconnects never burst.
 
 ## What this means for the collector design
 
