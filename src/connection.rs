@@ -74,6 +74,10 @@ const ENGINE_GRACE: Duration = Duration::from_millis(500);
 /// and shutdown until the OS gave up.
 const WRITE_TIMEOUT: Duration = Duration::from_secs(5);
 
+/// Payload bytes received across every leg, for the dashboard: a saturated
+/// downlink shows up as delivery latency (see FINDINGS.md).
+pub static BYTES_RECEIVED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
 enum Exit {
     Cancelled,
     Reconnect(&'static str),
@@ -223,6 +227,7 @@ async fn session<E: Exchange>(
                 last_frame = Instant::now();
                 match frame? {
                     Message::Text(text) => {
+                        BYTES_RECEIVED.fetch_add(text.len() as u64, std::sync::atomic::Ordering::Relaxed);
                         if let Err(e) = exchange.decode(&text, &mut events) {
                             let head: String = text.chars().take(200).collect();
                             tracing::warn!(?id, error = %e, frame = %head, "undecodable frame");

@@ -127,8 +127,9 @@ async function tick() {
   }
   const st = s.stats;
   const rate = prev ? Math.max(0, st.written - prev.written) : 0;
+  const mbps = prev ? Math.max(0, s.bytes_received - prev.bytes) * 8 / 1e6 : 0;
   if (prev) history.push(rate);
-  prev = st;
+  prev = { ...st, bytes: s.bytes_received };
   const copies = st.written + st.duplicates;
   $('tiles').innerHTML = [
     tile('Markets served', fmt(s.served), `of ${fmt(s.markets)} subscribed`),
@@ -137,6 +138,7 @@ async function tick() {
     tile('Redundant copies dropped', copies ? `${(100 * st.duplicates / copies).toFixed(0)}%` : '–', `${fmt(st.duplicates)} slower copies`),
     tile('REST checks', fmt(st.verified), `${fmt(st.mismatches)} confirmed mismatches`),
     tile('Failovers', fmt(st.failovers), `${fmt(st.outages)} outages · ${fmt(st.resyncs)} resyncs`),
+    tile('Inbound', `${mbps.toFixed(0)} Mbps`, 'websocket payload'),
     tile('Writer backlog', fmt(s.backlog), 'records queued'),
   ].join('');
   drawSpark();

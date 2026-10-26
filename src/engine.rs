@@ -205,6 +205,8 @@ pub struct Status {
     pub legs: usize,
     /// Records queued for the writer thread.
     pub backlog: usize,
+    /// Websocket payload bytes received since start.
+    pub bytes_received: u64,
     pub stats: Stats,
     /// The busiest books over the last second.
     pub busiest: Vec<BookView>,
@@ -626,6 +628,8 @@ impl Engine {
                 .count(),
             legs: self.last_data.len(),
             backlog: self.sink.backlog(),
+            bytes_received: crate::connection::BYTES_RECEIVED
+                .load(std::sync::atomic::Ordering::Relaxed),
             stats: self.stats.clone(),
             busiest,
         };
