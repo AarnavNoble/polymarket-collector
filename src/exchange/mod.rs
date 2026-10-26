@@ -3,6 +3,7 @@
 //! only describes how to discover symbols, encode commands and decode frames.
 
 pub mod polymarket;
+pub mod vpx;
 
 use std::future::Future;
 

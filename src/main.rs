@@ -3,14 +3,15 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
-use clap::Parser;
+use clap::{Parser, ValueEnum};
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 
 use engineering_challenge::connection::{LegConfig, Pacer};
 use engineering_challenge::engine::{Engine, VerifyLink};
-use engineering_challenge::exchange::polymarket::Polymarket;
+use engineering_challenge::exchange::{polymarket::Polymarket, vpx::Vpx};
 use engineering_challenge::manager::{self, ManagerConfig};
+use engineering_challenge::poll::{self, PollConfig};
 use engineering_challenge::{dashboard, verify, writer};
 
 /// Pause between full discovery passes (a pass itself takes about 20 min).
@@ -25,10 +26,16 @@ const RECYCLE_AFTER: Duration = Duration::from_secs(6 * 3600);
 const CONNECT_INTERVAL: Duration = Duration::from_millis(250);
 /// Books per REST verification round, stalest first.
 const VERIFY_BATCH: usize = 200;
+/// VPX is polled over REST: pause between rounds over every market, and
+/// between market list refreshes.
+const VPX_POLL: Duration = Duration::from_secs(2);
+const VPX_DISCOVERY: Duration = Duration::from_secs(60);
 
-/// Collects full-depth order book data for every live Polymarket market.
+/// Collects order book data for every live market on an exchange.
 #[derive(Parser)]
 struct Args {
+    #[arg(long, value_enum, default_value_t = Venue::Polymarket)]
+    exchange: Venue,
     /// Output file for SBE-encoded snapshots and updates.
     #[arg(long, default_value = "/dev/stdout")]
     output: PathBuf,
@@ -46,6 +53,14 @@ struct Args {
     dashboard: Option<SocketAddr>,
 }
 
+#[derive(Clone, Copy, PartialEq, Eq, ValueEnum)]
+enum Venue {
+    /// Full-depth websocket feed, redundant legs, REST verification.
+    Polymarket,
+    /// Vancouver Prediction Exchange: REST polling (needs VPX_API_KEY).
+    Vpx,
+}
+
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     tracing_subscriber::fmt()
@@ -56,6 +71,16 @@ async fn main() -> anyhow::Result<()> {
         .init();
     let args = Args::parse();
 
+    let vpx = match args.exchange {
+        Venue::Vpx => Some(Arc::new(Vpx::from_env()?)),
+        Venue::Polymarket => None,
+    };
+    // Polling is a single source, so redundancy and verification don't apply.
+    let legs = if vpx.is_some() {
+        1
+    } else {
+        usize::from(args.legs)
+    };
     let exchange = Arc::new(Polymarket {
         max_symbols: args.max_symbols,
         ..Default::default()
@@ -65,7 +90,7 @@ async fn main() -> anyhow::Result<()> {
     let (req_tx, req_rx) = mpsc::unbounded_channel();
     let cancel = CancellationToken::new();
 
-    let verify_link = (args.verify_secs > 0).then(|| {
+    let verify_link = (vpx.is_none() && args.verify_secs > 0).then(|| {
         let (requests, verify_rx) = mpsc::channel(1);
         let (verify_tx, results) = mpsc::channel(1);
         tokio::spawn(verify::run(exchange.clone(), verify_rx, verify_tx));
@@ -76,7 +101,7 @@ async fn main() -> anyhow::Result<()> {
             results,
         }
     });
-    let mut engine = Engine::new(usize::from(args.legs), sink, req_tx);
+    let mut engine = Engine::new(legs, sink, req_tx);
     if let Some(addr) = args.dashboard {
         let (status_tx, status_rx) = tokio::sync::watch::channel(Default::default());
         engine = engine.with_status(status_tx);
@@ -88,23 +113,37 @@ async fn main() -> anyhow::Result<()> {
         });
     }
     let engine = tokio::spawn(engine.run(engine_rx, verify_link));
-    let manager = tokio::spawn(manager::run(
-        exchange,
-        ManagerConfig {
-            legs: usize::from(args.legs),
-            full_discovery: FULL_DISCOVERY,
-            new_discovery: NEW_DISCOVERY,
-            leg: Arc::new(LegConfig {
-                stall_timeout: STALL_TIMEOUT,
-                heartbeat: Duration::from_secs(5),
-                max_lifetime: RECYCLE_AFTER,
-                pacer: Pacer::new(CONNECT_INTERVAL),
-            }),
-        },
-        engine_tx,
-        req_rx,
-        cancel.clone(),
-    ));
+    let source = if let Some(vpx) = vpx {
+        let cfg = PollConfig {
+            interval: VPX_POLL,
+            discovery: VPX_DISCOVERY,
+            concurrency: 8,
+        };
+        let cancel = cancel.clone();
+        tokio::spawn(async move {
+            if let Err(e) = poll::run(vpx, cfg, engine_tx, req_rx, cancel).await {
+                tracing::error!(error = %e, "polling stopped");
+            }
+        })
+    } else {
+        tokio::spawn(manager::run(
+            exchange,
+            ManagerConfig {
+                legs,
+                full_discovery: FULL_DISCOVERY,
+                new_discovery: NEW_DISCOVERY,
+                leg: Arc::new(LegConfig {
+                    stall_timeout: STALL_TIMEOUT,
+                    heartbeat: Duration::from_secs(5),
+                    max_lifetime: RECYCLE_AFTER,
+                    pacer: Pacer::new(CONNECT_INTERVAL),
+                }),
+            },
+            engine_tx,
+            req_rx,
+            cancel.clone(),
+        ))
+    };
 
     shutdown_signal().await;
     tracing::info!("shutting down; press Ctrl-C again to force exit");
@@ -114,10 +153,10 @@ async fn main() -> anyhow::Result<()> {
         std::process::exit(130);
     });
 
-    // Order matters: legs close (manager waits for them), then the engine
+    // Order matters: legs close (the source waits for them), then the engine
     // drains everything they sent, then the writer flushes and closes.
     // The writer is joined even if a task panicked, so its buffer is flushed.
-    let tasks = manager.await.and(engine.await);
+    let tasks = source.await.and(engine.await);
     let records = tokio::task::spawn_blocking(move || writer.join()).await??;
     tracing::info!(records, "output flushed and closed");
     Ok(tasks?)
