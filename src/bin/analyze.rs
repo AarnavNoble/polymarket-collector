@@ -67,6 +67,8 @@ struct Market {
     second: i64,
     in_second: u32,
     peak_per_second: u32,
+    /// Receive time minus exchange timestamp of each update, ms.
+    latency_ms: Vec<i32>,
 }
 
 impl Market {
@@ -122,8 +124,10 @@ struct Report {
     snapshots_corrected: u64,
     corrected_levels: u64,
     orphan_updates: u64,
-    /// Receive time minus exchange timestamp, in ms, at these percentiles.
+    /// Receive time minus exchange timestamp, in ms, at these percentiles:
+    /// over every update, and over the busiest 1% of markets' updates.
     latency_ms: Vec<(f64, f64)>,
+    busiest_1pct_latency_ms: Vec<(f64, f64)>,
     median_spread_cents: Option<f64>,
     busiest: Vec<Row>,
 }
@@ -136,7 +140,6 @@ async fn main() -> anyhow::Result<()> {
     let (mut first, mut last) = (i64::MAX, i64::MIN);
     let (mut updates, mut orphans) = (0u64, 0u64);
     let (mut snap_first, mut snap_same, mut snap_fixed) = (0u64, 0u64, 0u64);
-    let mut latency_us = Vec::new();
 
     while let Some(r) = replay.read()? {
         let t = r.received_at.timestamp_micros();
@@ -155,7 +158,8 @@ async fn main() -> anyhow::Result<()> {
                 updates += 1;
                 orphans += u64::from(orphan);
                 m.updates += 1;
-                latency_us.push(t - r.exchange_ts.timestamp_micros());
+                m.latency_ms
+                    .push(((t - r.exchange_ts.timestamp_micros()) / 1_000) as i32);
                 let second = t.div_euclid(1_000_000);
                 if second != m.second {
                     (m.second, m.in_second) = (second, 0);
@@ -176,21 +180,10 @@ async fn main() -> anyhow::Result<()> {
     let minutes = (last - first) as f64 / 60e6;
     let mut ranked: Vec<_> = markets.iter().filter(|(_, m)| m.updates > 0).collect();
     ranked.sort_unstable_by_key(|(_, m)| std::cmp::Reverse(m.updates));
-    let top_1pct: u64 = ranked
-        .iter()
-        .take(markets.len().div_ceil(100))
-        .map(|(_, m)| m.updates)
-        .sum();
-
-    latency_us.sort_unstable();
-    let latency_ms = [50.0, 90.0, 99.0, 99.9]
-        .into_iter()
-        .filter(|_| !latency_us.is_empty())
-        .map(|p| {
-            let i = ((p / 100.0 * latency_us.len() as f64) as usize).min(latency_us.len() - 1);
-            (p, latency_us[i] as f64 / 1e3)
-        })
-        .collect();
+    let top_1pct = &ranked[..markets.len().div_ceil(100).min(ranked.len())];
+    let top_1pct_updates: u64 = top_1pct.iter().map(|(_, m)| m.updates).sum();
+    let latency_ms = percentiles(markets.values());
+    let busiest_1pct_latency_ms = percentiles(top_1pct.iter().map(|(_, m)| *m));
 
     let spread =
         |m: &Market| (m.two_sided_us > 0).then(|| m.spread_us / m.two_sided_us as f64 / 1e4);
@@ -216,13 +209,14 @@ async fn main() -> anyhow::Result<()> {
         active_markets: ranked.len(),
         updates,
         updates_per_sec: updates as f64 / (minutes * 60.0),
-        top_1pct_share: top_1pct as f64 / updates.max(1) as f64,
+        top_1pct_share: top_1pct_updates as f64 / updates.max(1) as f64,
         snapshots_first: snap_first,
         snapshots_consistent: snap_same,
         snapshots_corrected: snap_fixed,
         corrected_levels: markets.values().map(|m| m.corrected_levels).sum(),
         orphan_updates: orphans,
         latency_ms,
+        busiest_1pct_latency_ms,
         median_spread_cents: spreads.get(spreads.len() / 2).copied(),
         busiest: busiest
             .iter()
@@ -247,6 +241,20 @@ async fn main() -> anyhow::Result<()> {
     Ok(())
 }
 
+/// Latency percentiles over every update of `markets`.
+fn percentiles<'a>(markets: impl Iterator<Item = &'a Market>) -> Vec<(f64, f64)> {
+    let mut all: Vec<i32> = markets.flat_map(|m| m.latency_ms.iter().copied()).collect();
+    all.sort_unstable();
+    [50.0, 90.0, 99.0, 99.9]
+        .into_iter()
+        .filter(|_| !all.is_empty())
+        .map(|p| {
+            let i = ((p / 100.0 * all.len() as f64) as usize).min(all.len() - 1);
+            (p, f64::from(all[i]))
+        })
+        .collect()
+}
+
 fn print_markdown(r: &Report) {
     let opt = |v: Option<f64>, digits: usize| v.map_or("–".into(), |v| format!("{v:.digits$}"));
     println!("## Dataset\n");
@@ -269,8 +277,10 @@ fn print_markdown(r: &Report) {
 
     println!("\n## Feed quality\n");
     println!("| | |\n|---|---|");
-    for (p, ms) in &r.latency_ms {
-        println!("| Delivery latency p{p} (receive − exchange timestamp) | {ms:.0} ms |");
+    for ((p, all), (_, busy)) in r.latency_ms.iter().zip(&r.busiest_1pct_latency_ms) {
+        println!(
+            "| Delivery latency p{p}, all / busiest 1% of markets | {all:.0} / {busy:.0} ms |"
+        );
     }
     println!(
         "| Snapshots matching the replayed book | {} |",
