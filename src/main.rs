@@ -1,3 +1,4 @@
+use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
@@ -10,7 +11,7 @@ use engineering_challenge::connection::{LegConfig, Pacer};
 use engineering_challenge::engine::{Engine, VerifyLink};
 use engineering_challenge::exchange::polymarket::Polymarket;
 use engineering_challenge::manager::{self, ManagerConfig};
-use engineering_challenge::{verify, writer};
+use engineering_challenge::{dashboard, verify, writer};
 
 /// Pause between full discovery passes (a pass itself takes about 20 min).
 const FULL_DISCOVERY: Duration = Duration::from_secs(300);
@@ -40,6 +41,9 @@ struct Args {
     /// Cap symbols per discovery pass (for local testing).
     #[arg(long)]
     max_symbols: Option<usize>,
+    /// Serve a live dashboard at this address, e.g. 127.0.0.1:8080.
+    #[arg(long)]
+    dashboard: Option<SocketAddr>,
 }
 
 #[tokio::main]
@@ -72,8 +76,18 @@ async fn main() -> anyhow::Result<()> {
             results,
         }
     });
-    let engine =
-        tokio::spawn(Engine::new(usize::from(args.legs), sink, req_tx).run(engine_rx, verify_link));
+    let mut engine = Engine::new(usize::from(args.legs), sink, req_tx);
+    if let Some(addr) = args.dashboard {
+        let (status_tx, status_rx) = tokio::sync::watch::channel(Default::default());
+        engine = engine.with_status(status_tx);
+        let cancel = cancel.clone();
+        tokio::spawn(async move {
+            if let Err(e) = dashboard::serve(addr, status_rx, cancel).await {
+                tracing::error!(error = %e, "dashboard stopped");
+            }
+        });
+    }
+    let engine = tokio::spawn(engine.run(engine_rx, verify_link));
     let manager = tokio::spawn(manager::run(
         exchange,
         ManagerConfig {

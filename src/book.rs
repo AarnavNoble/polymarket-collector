@@ -73,6 +73,46 @@ impl OrderBook {
         self.asks.iter().copied()
     }
 
+    pub fn best_bid(&self) -> Option<Level> {
+        self.bids.last().copied()
+    }
+
+    pub fn best_ask(&self) -> Option<Level> {
+        self.asks.first().copied()
+    }
+
+    /// Quantity resting at `price` on `side` (0 if none).
+    pub fn qty_at(&self, side: Side, price: i64) -> i64 {
+        let levels = match side {
+            Side::Buy => &self.bids,
+            Side::Sell => &self.asks,
+        };
+        levels
+            .binary_search_by_key(&price, |l| l.price)
+            .map_or(0, |i| levels[i].qty)
+    }
+
+    /// Number of (side, price) levels whose quantity differs between the books.
+    pub fn diff(&self, other: &Self) -> usize {
+        fn side(a: &[Level], b: &[Level]) -> usize {
+            let (mut i, mut j, mut n) = (0, 0, 0);
+            while i < a.len() || j < b.len() {
+                match (a.get(i), b.get(j)) {
+                    (Some(x), Some(y)) if x.price == y.price => {
+                        n += usize::from(x.qty != y.qty);
+                        i += 1;
+                        j += 1;
+                    }
+                    (Some(x), Some(y)) if x.price < y.price => (n, i) = (n + 1, i + 1),
+                    (Some(_), None) => (n, i) = (n + 1, i + 1),
+                    _ => (n, j) = (n + 1, j + 1),
+                }
+            }
+            n
+        }
+        side(&self.bids, &other.bids) + side(&self.asks, &other.asks)
+    }
+
     pub fn to_snapshot(
         &self,
         symbol: &str,
@@ -123,6 +163,19 @@ mod tests {
         );
         assert_eq!(book.bids().map(|l| l.price).collect::<Vec<_>>(), [3, 1]);
         assert_eq!(book.asks().map(|l| l.price).collect::<Vec<_>>(), [5, 9]);
+    }
+
+    #[test]
+    fn diff_counts_levels_that_differ() {
+        let l = |price, qty| Level { price, qty };
+        let a = OrderBook::from_levels(&[l(1, 5), l(2, 5)], &[l(8, 1)]);
+        let b = OrderBook::from_levels(&[l(2, 6), l(3, 1)], &[l(8, 1)]);
+        assert_eq!(a.diff(&a), 0);
+        assert_eq!(a.diff(&b), 3); // 1 removed, 2 resized, 3 added
+        assert_eq!(b.best_bid(), Some(l(3, 1)));
+        assert_eq!(b.best_ask(), Some(l(8, 1)));
+        assert_eq!(b.qty_at(Side::Buy, 2), 6);
+        assert_eq!(b.qty_at(Side::Sell, 2), 0);
     }
 
     proptest::proptest! {

@@ -1,0 +1,157 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Collector live</title>
+<style>
+  :root {
+    --bg: #f7f7f5; --panel: #ffffff; --ink: #1d1d1b; --muted: #6b6b66; --line: #e4e4df;
+    --bid: #2a6fdb; --ask: #d9730d; --spark: #2a6fdb; --bad: #c4321c;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root { --bg: #141413; --panel: #1e1e1c; --ink: #ececea; --muted: #9a9a94; --line: #2e2e2b;
+      --bid: #6b9cf0; --ask: #f0a04b; --spark: #6b9cf0; --bad: #f07a63; }
+  }
+  * { box-sizing: border-box; }
+  body { margin: 0; background: var(--bg); color: var(--ink);
+    font: 14px/1.4 ui-sans-serif, system-ui, -apple-system, "Segoe UI", sans-serif; }
+  main { max-width: 1200px; margin: 0 auto; padding: 24px 16px 48px; }
+  header { display: flex; align-items: baseline; gap: 12px; flex-wrap: wrap; margin-bottom: 20px; }
+  h1 { font-size: 20px; margin: 0; font-weight: 600; }
+  .dot { width: 8px; height: 8px; border-radius: 50%; background: var(--bid); display: inline-block; }
+  .dot.down { background: var(--bad); }
+  .muted { color: var(--muted); }
+  .num { font-variant-numeric: tabular-nums; }
+  .tiles { display: grid; grid-template-columns: repeat(auto-fit, minmax(140px, 1fr)); gap: 12px; }
+  .tile, .card, .spark { background: var(--panel); border: 1px solid var(--line); border-radius: 10px; padding: 14px 16px; }
+  .tile .v { font-size: 24px; font-weight: 600; margin-top: 2px; }
+  .tile .s { font-size: 12px; }
+  .spark { margin-top: 12px; position: relative; }
+  .spark svg { width: 100%; height: 90px; display: block; }
+  .tip { position: absolute; pointer-events: none; font-size: 12px; background: var(--ink); color: var(--panel);
+    padding: 3px 6px; border-radius: 4px; display: none; white-space: nowrap; }
+  h2 { font-size: 15px; font-weight: 600; margin: 28px 0 12px; }
+  .books { display: grid; grid-template-columns: repeat(auto-fill, minmax(270px, 1fr)); gap: 12px; }
+  .card h3 { font-size: 13px; font-weight: 600; margin: 0 0 2px; min-height: 36px;
+    display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical; overflow: hidden; }
+  .card h3 a { color: inherit; text-decoration: none; }
+  .card .meta { font-size: 12px; margin-bottom: 8px; }
+  .ladder { width: 100%; border-collapse: collapse; font-size: 12px; }
+  .ladder td { padding: 1px 4px; position: relative; }
+  .ladder td.p { width: 52px; }
+  .bar { position: absolute; top: 2px; bottom: 2px; left: 0; border-radius: 0 4px 4px 0; opacity: .28; }
+  .ladder td span { position: relative; }
+  .gapline td { border-top: 1px dashed var(--line); }
+  footer { margin-top: 28px; font-size: 12px; }
+</style>
+</head>
+<body>
+<main>
+  <header>
+    <h1>Polymarket collector</h1>
+    <span><span class="dot" id="live"></span> <span class="muted" id="state">connecting…</span></span>
+  </header>
+  <section class="tiles" id="tiles"></section>
+  <div class="spark">
+    <div class="muted s">Updates written per second, last 2 minutes <span class="num" id="peak"></span></div>
+    <svg id="spark" viewBox="0 0 600 90" preserveAspectRatio="none" aria-label="Updates per second"></svg>
+    <div class="tip" id="tip"></div>
+  </div>
+  <h2>Busiest books, last second</h2>
+  <section class="books" id="books"></section>
+  <footer class="muted">Prices in cents; sizes in shares. Bids <span style="color:var(--bid)">■</span> asks <span style="color:var(--ask)">■</span>, best levels nearest the dashed line.</footer>
+</main>
+<script>
+const $ = id => document.getElementById(id);
+const fmt = n => n.toLocaleString('en-US', { maximumFractionDigits: 0 });
+const history = [];
+const names = new Map();
+let prev = null;
+
+function tile(label, value, sub) {
+  return `<div class="tile"><div class="muted s">${label}</div><div class="v num">${value}</div><div class="muted s num">${sub ?? ''}</div></div>`;
+}
+
+async function lookup(ids) {
+  const missing = ids.filter(id => !names.has(id));
+  if (!missing.length) return;
+  missing.forEach(id => names.set(id, null));
+  const q = missing.map(id => `clob_token_ids=${id}`).join('&');
+  try {
+    const markets = await (await fetch(`https://gamma-api.polymarket.com/markets?closed=any&${q}`)).json();
+    for (const m of markets) for (const id of JSON.parse(m.clobTokenIds || '[]'))
+      if (names.has(id)) names.set(id, { q: m.question, slug: m.slug });
+  } catch {}
+}
+
+function ladder(b) {
+  const max = Math.max(1, ...b.bids.slice(0, 5).map(l => l[1]), ...b.asks.slice(0, 5).map(l => l[1]));
+  const row = (l, color) => `<tr><td class="p num">${(l[0] / 1e4).toFixed(1)}¢</td><td><div class="bar" style="width:${Math.min(100, 100 * l[1] / max)}%;background:${color}"></div><span class="num">${fmt(l[1] / 1e6)}</span></td></tr>`;
+  const asks = b.asks.slice(0, 5).reverse().map(l => row(l, 'var(--ask)')).join('');
+  const bids = b.bids.slice(0, 5).map(l => row(l, 'var(--bid)')).join('');
+  return `<table class="ladder">${asks}<tr class="gapline"><td colspan="2"></td></tr>${bids}</table>`;
+}
+
+function drawSpark() {
+  const svg = $('spark'), w = 600, h = 90, n = 120;
+  const pts = history.slice(-n);
+  if (pts.length < 2) return;
+  const max = Math.max(1, ...pts);
+  $('peak').textContent = `· peak ${fmt(max)}/s`;
+  const xy = pts.map((v, i) => [(i + n - pts.length) * w / (n - 1), h - 4 - (h - 8) * v / max]);
+  svg.innerHTML = `<polyline fill="none" stroke="var(--spark)" stroke-width="2" vector-effect="non-scaling-stroke" stroke-linejoin="round" points="${xy.map(p => p.join(',')).join(' ')}"/>`;
+  svg.onmousemove = e => {
+    const r = svg.getBoundingClientRect();
+    const i = Math.round((e.clientX - r.left) / r.width * (n - 1)) - (n - pts.length);
+    if (i < 0 || i >= pts.length) return;
+    const tip = $('tip');
+    tip.style.display = 'block';
+    tip.style.left = `${e.clientX - r.left + 18}px`;
+    tip.style.top = '22px';
+    tip.textContent = `${fmt(pts[i])}/s · ${pts.length - 1 - i}s ago`;
+  };
+  svg.onmouseleave = () => $('tip').style.display = 'none';
+}
+
+async function tick() {
+  let s;
+  try {
+    s = await (await fetch('/status', { cache: 'no-store' })).json();
+    $('live').className = 'dot';
+    $('state').textContent = 'live';
+  } catch {
+    $('live').className = 'dot down';
+    $('state').textContent = 'collector unreachable';
+    return;
+  }
+  const st = s.stats;
+  const rate = prev ? Math.max(0, st.written - prev.written) : 0;
+  if (prev) history.push(rate);
+  prev = st;
+  const copies = st.written + st.duplicates;
+  $('tiles').innerHTML = [
+    tile('Markets served', fmt(s.served), `of ${fmt(s.markets)} subscribed`),
+    tile('Connections live', fmt(s.legs_live), `of ${fmt(s.legs)} legs`),
+    tile('Updates/s', fmt(rate), `${fmt(st.written)} written`),
+    tile('Redundant copies dropped', copies ? `${(100 * st.duplicates / copies).toFixed(0)}%` : '–', `${fmt(st.duplicates)} slower copies`),
+    tile('REST checks', fmt(st.verified), `${fmt(st.mismatches)} confirmed mismatches`),
+    tile('Failovers', fmt(st.failovers), `${fmt(st.outages)} outages · ${fmt(st.resyncs)} resyncs`),
+    tile('Writer backlog', fmt(s.backlog), 'records queued'),
+  ].join('');
+  drawSpark();
+  await lookup(s.busiest.map(b => b.symbol));
+  $('books').innerHTML = s.busiest.map(b => {
+    const n = names.get(b.symbol);
+    const title = n ? `<a href="https://polymarket.com/market/${n.slug}" target="_blank" rel="noopener">${n.q.replace(/</g, '&lt;')}</a>` : `${b.symbol.slice(0, 16)}…`;
+    const bid = b.bids[0], ask = b.asks[0];
+    const meta = bid && ask ? `mid ${((bid[0] + ask[0]) / 2e4).toFixed(1)}¢ · spread ${((ask[0] - bid[0]) / 1e4).toFixed(1)}¢` : 'one-sided';
+    return `<div class="card"><h3>${title}</h3><div class="meta muted num">${b.updates} updates · ${meta}</div>${ladder(b)}</div>`;
+  }).join('');
+}
+
+tick();
+setInterval(tick, 1000);
+</script>
+</body>
+</html>

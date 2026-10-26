@@ -11,7 +11,8 @@ use std::time::Duration;
 
 use chrono::{DateTime, DurationRound, TimeDelta, Utc};
 use rustc_hash::{FxHashMap, FxHashSet, FxHasher};
-use tokio::sync::mpsc;
+use serde::Serialize;
+use tokio::sync::{mpsc, watch};
 use tokio::time::Instant;
 
 use crate::Side;
@@ -149,6 +150,8 @@ struct Market {
     /// can capture the middle of a same-millisecond burst, so a mismatch is
     /// confirmed only if the next check disagrees at the same timestamp.
     suspect: Option<DateTime<Utc>>,
+    /// Updates written since the last status report.
+    recent: u32,
 }
 
 /// Connects the engine to a task that fetches reference books (see
@@ -160,8 +163,8 @@ pub struct VerifyLink {
     pub results: mpsc::Receiver<Vec<Event>>,
 }
 
-#[derive(Default, Debug)]
-struct Stats {
+#[derive(Default, Debug, Clone, Serialize)]
+pub struct Stats {
     /// Updates written, and how many of them a non-first leg also delivered.
     written: u64,
     duplicates: u64,
@@ -186,6 +189,34 @@ pub struct Engine {
     sink: Sink,
     requests: mpsc::UnboundedSender<Request>,
     stats: Stats,
+    status: Option<watch::Sender<Status>>,
+}
+
+/// What the collector is doing right now, published once a second for the
+/// dashboard.
+#[derive(Debug, Clone, Default, Serialize)]
+pub struct Status {
+    pub markets: usize,
+    /// Markets whose output book is current.
+    pub served: usize,
+    /// Legs that delivered a book change within [`FREEZE_TIMEOUT`], of all
+    /// legs seen.
+    pub legs_live: usize,
+    pub legs: usize,
+    /// Records queued for the writer thread.
+    pub backlog: usize,
+    pub stats: Stats,
+    /// The busiest books over the last second.
+    pub busiest: Vec<BookView>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct BookView {
+    pub symbol: String,
+    pub updates: u32,
+    /// Best first, as (price, quantity) at 1e6 scale.
+    pub bids: Vec<(i64, i64)>,
+    pub asks: Vec<(i64, i64)>,
 }
 
 impl Engine {
@@ -201,7 +232,14 @@ impl Engine {
             sink,
             requests,
             stats: Stats::default(),
+            status: None,
         }
+    }
+
+    /// Publishes a [`Status`] to `tx` every second.
+    pub fn with_status(mut self, tx: watch::Sender<Status>) -> Self {
+        self.status = Some(tx);
+        self
     }
 
     /// Runs until every sender of `rx` is dropped, writing a snapshot of every
@@ -213,6 +251,7 @@ impl Engine {
                 .map_or(Duration::from_secs(3600), |v| v.interval),
         );
         let mut health_timer = tokio::time::interval(HEALTH_INTERVAL);
+        let mut status_timer = tokio::time::interval(Duration::from_secs(1));
         let next_minute = || {
             let now = Utc::now();
             let boundary =
@@ -232,6 +271,7 @@ impl Engine {
                     snapshot_timer.as_mut().reset(next_minute());
                 }
                 _ = health_timer.tick() => self.health_check(Instant::now()),
+                _ = status_timer.tick(), if self.status.is_some() => self.publish_status(),
                 _ = verify_timer.tick(), if verify.is_some() => {
                     let link = verify.as_ref().unwrap();
                     // Skip a round rather than queue if the fetcher is behind;
@@ -266,6 +306,7 @@ impl Engine {
                         output: None,
                         verified_at: None,
                         suspect: None,
+                        recent: 0,
                     });
                 }
             }
@@ -369,6 +410,7 @@ impl Engine {
                 out.exchange_ts = out.exchange_ts.max(exchange_ts);
                 if out.book.set(side, price, qty) {
                     self.stats.written += 1;
+                    m.recent += 1;
                     self.sink.send(Record::Update(PriceLevelUpdateDomain {
                         backtest_timestamp: recv_ts,
                         exchange_timestamp: exchange_ts,
@@ -547,6 +589,48 @@ impl Engine {
                 leg,
                 symbols: vec![symbol.clone()],
             });
+        }
+    }
+
+    fn publish_status(&mut self) {
+        const BOOKS: usize = 8;
+        const DEPTH: usize = 10;
+        let now = Instant::now();
+        let mut active: Vec<(u32, &String, &mut Market)> = self
+            .markets
+            .iter_mut()
+            .filter(|(_, m)| m.recent > 0)
+            .map(|(s, m)| (std::mem::take(&mut m.recent), s, m))
+            .collect();
+        active.sort_unstable_by_key(|(n, ..)| std::cmp::Reverse(*n));
+        let busiest = active
+            .iter()
+            .take(BOOKS)
+            .filter_map(|(n, symbol, m)| {
+                let book = &m.output.as_ref()?.book;
+                Some(BookView {
+                    symbol: (*symbol).clone(),
+                    updates: *n,
+                    bids: book.bids().take(DEPTH).map(|l| (l.price, l.qty)).collect(),
+                    asks: book.asks().take(DEPTH).map(|l| (l.price, l.qty)).collect(),
+                })
+            })
+            .collect();
+        let status = Status {
+            markets: self.markets.len(),
+            served: self.markets.values().filter(|m| m.output.is_some()).count(),
+            legs_live: self
+                .last_data
+                .values()
+                .filter(|t| now.duration_since(**t) < FREEZE_TIMEOUT)
+                .count(),
+            legs: self.last_data.len(),
+            backlog: self.sink.backlog(),
+            stats: self.stats.clone(),
+            busiest,
+        };
+        if let Some(tx) = &self.status {
+            tx.send_replace(status);
         }
     }
 

@@ -22,6 +22,7 @@ const GAMMA: &str = "https://gamma-api.polymarket.com/markets/keyset";
 /// Concurrent Gamma cursors; Gamma allows 300 listing requests per 10 s.
 const DISCOVERY_PARALLELISM: usize = 8;
 const CLOB_BOOKS: &str = "https://clob.polymarket.com/books";
+const GAMMA_MARKETS: &str = "https://gamma-api.polymarket.com/markets";
 
 pub struct Polymarket {
     pub ws_url: String,
@@ -228,6 +229,7 @@ struct GammaMarket {
     position_ids: Option<Vec<String>>,
     /// Outcome labels aligned with the ids, as a JSON-encoded string array.
     outcomes: Option<String>,
+    question: Option<String>,
 }
 
 impl GammaMarket {
@@ -520,6 +522,44 @@ async fn paginate(
             _ => return Ok(()),
         }
     }
+}
+
+/// Looks up each symbol's market question, for research reports. Symbols
+/// that can't be resolved are left out.
+pub async fn market_names(
+    http: &reqwest::Client,
+    symbols: &[String],
+) -> anyhow::Result<rustc_hash::FxHashMap<String, String>> {
+    let mut names = rustc_hash::FxHashMap::default();
+    // v1 symbols are CLOB token ids and v2 symbols are position ids.
+    for filter in ["clob_token_ids", "position_ids"] {
+        let missing: Vec<_> = symbols.iter().filter(|s| !names.contains_key(*s)).collect();
+        for chunk in missing.chunks(100) {
+            let mut query = vec![("closed", "any")];
+            query.extend(chunk.iter().map(|s| (filter, s.as_str())));
+            let markets: Vec<GammaMarket> = http
+                .get(GAMMA_MARKETS)
+                .query(&query)
+                .send()
+                .await?
+                .error_for_status()?
+                .json()
+                .await?;
+            for m in markets {
+                let Some(question) = m.question else { continue };
+                let clob: Vec<String> = m
+                    .clob_token_ids
+                    .as_deref()
+                    .and_then(|ids| serde_json::from_str(ids).ok())
+                    .unwrap_or_default();
+                for id in clob.into_iter().chain(m.position_ids.unwrap_or_default()) {
+                    names.insert(id, question.clone());
+                }
+            }
+        }
+    }
+    names.retain(|id, _| symbols.contains(id));
+    Ok(names)
 }
 
 #[cfg(test)]
